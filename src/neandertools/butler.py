@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Optional, Union
 
 from lsst.daf.butler import Butler
-from lsst.geom import Box2I, Point2I
+from lsst.geom import Box2I, Point2I, SpherePoint, degrees
 
 DataId = dict[str, Any]
 SkyResolver = Callable[[float, float, Optional[Union[datetime, str]]], Iterable[DataId]]
@@ -38,7 +38,7 @@ class ButlerCutoutService:
 
         if visit is not None:
             image = self._butler.get(dataset_type, dataId={"visit": visit, "detector": detector})
-            return [self._extract_cutout(image, x=x, y=y, h=h, w=w)]
+            return [self._extract_cutout(image, x=x, y=y, ra=ra, dec=dec, h=h, w=w)]
 
         assert ra is not None and dec is not None
         if self._sky_resolver is None:
@@ -52,13 +52,15 @@ class ButlerCutoutService:
             data_ids = data_ids[:limit]
 
         images = [self._butler.get(dataset_type, dataId=data_id) for data_id in data_ids]
-        return [self._extract_cutout(image, x=x, y=y, h=h, w=w) for image in images]
+        return [self._extract_cutout(image, x=x, y=y, ra=ra, dec=dec, h=h, w=w) for image in images]
 
     def _extract_cutout(
         self,
         image: Any,
         x: Optional[float],
         y: Optional[float],
+        ra: Optional[float],
+        dec: Optional[float],
         h: Optional[int],
         w: Optional[int],
     ) -> Any:
@@ -66,8 +68,18 @@ class ButlerCutoutService:
             return image
 
         bbox = image.getBBox()
-        x_center = float(x) if x is not None else (bbox.getMinX() + bbox.getMaxX()) / 2.0
-        y_center = float(y) if y is not None else (bbox.getMinY() + bbox.getMaxY()) / 2.0
+        if x is not None and y is not None:
+            x_center = float(x)
+            y_center = float(y)
+        else:
+            assert ra is not None and dec is not None
+            if not hasattr(image, "getWcs") or image.getWcs() is None:
+                raise ValueError("Image does not have a WCS; cannot use ra/dec center")
+            sky = SpherePoint(ra * degrees, dec * degrees)
+            pixel = image.getWcs().skyToPixel(sky)
+            x_center = float(pixel.getX())
+            y_center = float(pixel.getY())
+
         w_i = int(w) if w is not None else int(bbox.getMaxX() - bbox.getMinX() + 1)
         h_i = int(h) if h is not None else int(bbox.getMaxY() - bbox.getMinY() + 1)
 
@@ -108,16 +120,24 @@ def _validate_request(
     visit: Optional[int],
     detector: Optional[int],
 ) -> None:
+    xy_mode = x is not None or y is not None
+    sky_center_mode = ra is not None or dec is not None
+
+    if xy_mode and sky_center_mode:
+        raise ValueError("Use either (x, y) or (ra, dec) for cutout center, not both")
+    if not xy_mode and not sky_center_mode:
+        raise ValueError("Provide either (x, y) or (ra, dec) for cutout center")
+    if xy_mode and (x is None or y is None):
+        raise ValueError("Both x and y must be provided together")
+    if sky_center_mode and (ra is None or dec is None):
+        raise ValueError("Both ra and dec must be provided together")
+
     if h is not None and h <= 0:
         raise ValueError("h must be > 0")
     if w is not None and w <= 0:
         raise ValueError("w must be > 0")
 
     visit_mode = visit is not None or detector is not None
-    sky_mode = ra is not None or dec is not None
-
-    if visit_mode and sky_mode:
-        raise ValueError("Use either (visit, detector) or (ra, dec), not both")
 
     if visit_mode and (visit is None or detector is None):
         raise ValueError("Both visit and detector must be provided together")
