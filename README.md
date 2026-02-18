@@ -13,14 +13,23 @@ svc = nt.cutouts_from_butler(
 )
 
 # dataset_type defaults to "visit_image"
-images = svc.cutout(visit=2024110800253, detector=5, radius=100)
+images = svc.cutout(visit=2024110800253, detector=5, x=2036, y=2000, h=201, w=201)
 
 # optional override
-images = svc.cutout(visit=2024110800253, detector=5, radius=100, dataset_type="preliminary_visit_image")
+images = svc.cutout(
+    visit=2024110800253,
+    detector=5,
+    x=2036,
+    y=2000,
+    h=201,
+    w=201,
+    dataset_type="preliminary_visit_image",
+)
 ```
 
 ## Notes
 
 - `collections` is required when creating the service.
 - `dataset_type` is selected per `cutout(...)` call and defaults to `"visit_image"`.
+- `cutout(...)` takes center pixel coordinates (`x`, `y`) and size (`h`, `w`).
 - The sky-coordinate mode (`ra/dec/time`) is wired and needs a `sky_resolver` callback.

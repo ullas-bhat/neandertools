@@ -24,18 +24,22 @@ class ButlerCutoutService:
         ra: Optional[float] = None,
         dec: Optional[float] = None,
         time: Optional[Union[datetime, str]] = None,
-        radius: float = 10.0,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        h: Optional[int] = None,
+        w: Optional[int] = None,
         dataset_type: str = "visit_image",
         *,
         visit: Optional[int] = None,
         detector: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> list[Any]:
-        _validate_request(ra=ra, dec=dec, radius=radius, visit=visit, detector=detector)
+        _validate_request(ra=ra, dec=dec, x=x, y=y, h=h, w=w, visit=visit, detector=detector)
+        assert x is not None and y is not None and h is not None and w is not None
 
         if visit is not None:
             image = self._butler.get(dataset_type, dataId={"visit": visit, "detector": detector})
-            return [self._extract_cutout(image, radius)]
+            return [self._extract_cutout(image, x=x, y=y, h=h, w=w)]
 
         assert ra is not None and dec is not None
         if self._sky_resolver is None:
@@ -49,18 +53,21 @@ class ButlerCutoutService:
             data_ids = data_ids[:limit]
 
         images = [self._butler.get(dataset_type, dataId=data_id) for data_id in data_ids]
-        return [self._extract_cutout(image, radius) for image in images]
+        return [self._extract_cutout(image, x=x, y=y, h=h, w=w) for image in images]
 
-    def _extract_cutout(self, image: Any, radius: float) -> Any:
+    def _extract_cutout(self, image: Any, x: float, y: float, h: int, w: int) -> Any:
         if not hasattr(image, "getBBox") or not hasattr(image, "Factory"):
             return image
 
         bbox = image.getBBox()
-        x_center = (bbox.getMinX() + bbox.getMaxX()) // 2
-        y_center = (bbox.getMinY() + bbox.getMaxY()) // 2
-        r = int(radius)
+        w_i = int(w)
+        h_i = int(h)
+        x0 = int(round(x - (w_i - 1) / 2.0))
+        y0 = int(round(y - (h_i - 1) / 2.0))
+        x1 = x0 + w_i - 1
+        y1 = y0 + h_i - 1
 
-        cutout_box = Box2I(Point2I(x_center - r, y_center - r), Point2I(x_center + r, y_center + r))
+        cutout_box = Box2I(Point2I(x0, y0), Point2I(x1, y1))
         try:
             cutout_box.clip(bbox)
         except Exception:
@@ -85,12 +92,19 @@ def _validate_request(
     *,
     ra: Optional[float],
     dec: Optional[float],
-    radius: float,
+    x: Optional[float],
+    y: Optional[float],
+    h: Optional[int],
+    w: Optional[int],
     visit: Optional[int],
     detector: Optional[int],
 ) -> None:
-    if radius <= 0:
-        raise ValueError("radius must be > 0")
+    if x is None or y is None:
+        raise ValueError("Both x and y must be provided")
+    if h is None or w is None:
+        raise ValueError("Both h and w must be provided")
+    if h <= 0 or w <= 0:
+        raise ValueError("h and w must be > 0")
 
     visit_mode = visit is not None or detector is not None
     sky_mode = ra is not None or dec is not None
