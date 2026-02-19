@@ -37,6 +37,7 @@ class ButlerCutoutService:
         visit: Optional[Union[int, Sequence[int]]] = None,
         detector: Optional[Union[int, Sequence[int]]] = None,
         limit: Optional[int] = None,
+        pad: bool = True,
     ) -> list[Any]:
         _validate_request(ra=ra, dec=dec, x=x, y=y, h=h, w=w, visit=visit, detector=detector)
         x_mode = _is_provided(x) or _is_provided(y)
@@ -76,7 +77,7 @@ class ButlerCutoutService:
                 visit_values, detector_values, x_values, y_values, ra_values, dec_values
             ):
                 image = self._butler.get(dataset_type, dataId={"visit": int(v), "detector": int(d)})
-                out.append(self._extract_cutout(image, x=xx, y=yy, ra=rr, dec=dd, h=h, w=w))
+                out.append(self._extract_cutout(image, x=xx, y=yy, ra=rr, dec=dd, h=h, w=w, pad=pad))
             return out
 
         if self._sky_resolver is None:
@@ -90,7 +91,9 @@ class ButlerCutoutService:
             assert rr is not None and dd is not None
             for data_id in self._sky_resolver(float(rr), float(dd), time):
                 image = self._butler.get(dataset_type, dataId=data_id)
-                out.append(self._extract_cutout(image, x=None, y=None, ra=float(rr), dec=float(dd), h=h, w=w))
+                out.append(
+                    self._extract_cutout(image, x=None, y=None, ra=float(rr), dec=float(dd), h=h, w=w, pad=pad)
+                )
                 if limit is not None and len(out) >= limit:
                     return out
         return out
@@ -155,11 +158,12 @@ class ButlerCutoutService:
         dec: Optional[float],
         h: Optional[int],
         w: Optional[int],
+        pad: bool,
     ) -> Any:
         if not hasattr(image, "getBBox") or not hasattr(image, "Factory"):
             return image
 
-        bbox = image.getBBox()
+        bbox = self._as_box2i(image.getBBox())
         if x is not None and y is not None:
             x_center = float(x)
             y_center = float(y)
@@ -180,6 +184,23 @@ class ButlerCutoutService:
         x1 = x0 + w_i - 1
         y1 = y0 + h_i - 1
 
+        requested_box = Box2I(Point2I(x0, y0), Point2I(x1, y1))
+        if pad:
+            try:
+                cutout = image.Factory(image, requested_box)
+                if self._matches_requested_box(cutout, requested_box, h_i, w_i):
+                    return cutout
+            except Exception:
+                pass
+
+            return self._extract_padded_cutout(
+                image=image,
+                bbox=bbox,
+                requested_box=requested_box,
+                h=h_i,
+                w=w_i,
+            )
+
         cutout_box = Box2I(Point2I(x0, y0), Point2I(x1, y1))
         try:
             cutout_box.clip(bbox)
@@ -187,6 +208,86 @@ class ButlerCutoutService:
             pass
 
         return image.Factory(image, cutout_box)
+
+    def _extract_padded_cutout(self, image: Any, bbox: Any, requested_box: Any, h: int, w: int) -> Any:
+        import numpy as np
+
+        bbox = self._as_box2i(bbox)
+        clipped_box = Box2I(
+            Point2I(requested_box.getMinX(), requested_box.getMinY()),
+            Point2I(requested_box.getMaxX(), requested_box.getMaxY()),
+        )
+        clipped_box.clip(bbox)
+        source_cutout = image.Factory(image, clipped_box)
+
+        source_array = self._get_primary_array(source_cutout)
+        if source_array is None:
+            return source_cutout
+
+        padded_array = np.zeros((h, w), dtype=source_array.dtype)
+
+        x_off = clipped_box.getMinX() - requested_box.getMinX()
+        y_off = clipped_box.getMinY() - requested_box.getMinY()
+        padded_array[y_off : y_off + source_array.shape[0], x_off : x_off + source_array.shape[1]] = source_array
+
+        try:
+            if hasattr(image, "getWcs") and image.getWcs() is not None:
+                padded = image.Factory(requested_box, image.getWcs())
+            else:
+                padded = image.Factory(requested_box)
+            padded_target = self._get_primary_array(padded)
+            if padded_target is not None:
+                padded_target[:] = padded_array
+                return padded
+        except Exception:
+            pass
+
+        return padded_array
+
+    @staticmethod
+    def _matches_requested_box(cutout: Any, requested_box: Any, h: int, w: int) -> bool:
+        arr = ButlerCutoutService._get_primary_array(cutout)
+        if arr is not None:
+            return tuple(arr.shape) == (h, w)
+
+        if hasattr(cutout, "getBBox"):
+            try:
+                box = cutout.getBBox()
+                return (
+                    box.getMinX() == requested_box.getMinX()
+                    and box.getMinY() == requested_box.getMinY()
+                    and box.getMaxX() == requested_box.getMaxX()
+                    and box.getMaxY() == requested_box.getMaxY()
+                )
+            except Exception:
+                pass
+        return True
+
+    @staticmethod
+    def _get_primary_array(obj: Any) -> Any:
+        try:
+            if hasattr(obj, "getArray"):
+                return obj.getArray()
+        except Exception:
+            pass
+        try:
+            if hasattr(obj, "getImage") and hasattr(obj.getImage(), "getArray"):
+                return obj.getImage().getArray()
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _as_box2i(bbox: Any) -> Any:
+        if isinstance(bbox, Box2I):
+            return bbox
+        try:
+            return Box2I(
+                Point2I(int(bbox.getMinX()), int(bbox.getMinY())),
+                Point2I(int(bbox.getMaxX()), int(bbox.getMaxY())),
+            )
+        except Exception:
+            return bbox
 
     def _get_visit_detector_index(self, dataset_type: str) -> list[dict[str, Any]]:
         cached = self._visit_detector_index_cache.get(dataset_type)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from astropy.time import Time
+import numpy as np
 
 import neandertools as nt
 
@@ -21,15 +22,45 @@ class FakeBBox:
 
 
 class FakeImage:
-    def __init__(self, token="root"):
+    def __init__(self, token="root", array=None):
         self.token = token
+        if array is None:
+            self._array = np.arange(101 * 101, dtype=np.int64).reshape(101, 101)
+        else:
+            self._array = array
 
     def getBBox(self):
         return FakeBBox()
 
+    def getArray(self):
+        return self._array
+
     @staticmethod
-    def Factory(_image, _bbox):
-        return FakeImage(token="cutout")
+    def Factory(*args):
+        if len(args) == 2:
+            image, bbox = args
+            if hasattr(image, "getMinX") and hasattr(image, "getMaxX"):
+                w = image.getMaxX() - image.getMinX() + 1
+                h = image.getMaxY() - image.getMinY() + 1
+                return FakeImage(token="blank", array=np.zeros((h, w), dtype=np.int64))
+            if (
+                bbox.getMinX() < image.getBBox().getMinX()
+                or bbox.getMinY() < image.getBBox().getMinY()
+                or bbox.getMaxX() > image.getBBox().getMaxX()
+                or bbox.getMaxY() > image.getBBox().getMaxY()
+            ):
+                raise ValueError("bbox outside image bounds")
+
+            x0 = bbox.getMinX() - image.getBBox().getMinX()
+            y0 = bbox.getMinY() - image.getBBox().getMinY()
+            x1 = bbox.getMaxX() - image.getBBox().getMinX() + 1
+            y1 = bbox.getMaxY() - image.getBBox().getMinY() + 1
+            return FakeImage(token="cutout", array=image.getArray()[y0:y1, x0:x1].copy())
+
+        (bbox,) = args
+        w = bbox.getMaxX() - bbox.getMinX() + 1
+        h = bbox.getMaxY() - bbox.getMinY() + 1
+        return FakeImage(token="blank", array=np.zeros((h, w), dtype=np.int64))
 
     class _Wcs:
         class _Pixel:
@@ -59,6 +90,38 @@ class FakeButler:
         return {"data": dataId} if dataset_type == "raw" else FakeImage()
 
 
+class FakeImageSilentClip(FakeImage):
+    @staticmethod
+    def Factory(*args):
+        if len(args) == 2:
+            image, bbox = args
+            if hasattr(image, "getMinX") and hasattr(image, "getMaxX"):
+                w = image.getMaxX() - image.getMinX() + 1
+                h = image.getMaxY() - image.getMinY() + 1
+                return FakeImageSilentClip(token="blank", array=np.zeros((h, w), dtype=np.int64))
+            x0 = max(bbox.getMinX(), image.getBBox().getMinX())
+            y0 = max(bbox.getMinY(), image.getBBox().getMinY())
+            x1 = min(bbox.getMaxX(), image.getBBox().getMaxX())
+            y1 = min(bbox.getMaxY(), image.getBBox().getMaxY())
+
+            sx0 = x0 - image.getBBox().getMinX()
+            sy0 = y0 - image.getBBox().getMinY()
+            sx1 = x1 - image.getBBox().getMinX() + 1
+            sy1 = y1 - image.getBBox().getMinY() + 1
+            return FakeImageSilentClip(token="cutout", array=image.getArray()[sy0:sy1, sx0:sx1].copy())
+
+        (bbox,) = args
+        w = bbox.getMaxX() - bbox.getMinX() + 1
+        h = bbox.getMaxY() - bbox.getMinY() + 1
+        return FakeImageSilentClip(token="blank", array=np.zeros((h, w), dtype=np.int64))
+
+
+class FakeButlerSilentClip(FakeButler):
+    def get(self, dataset_type, dataId=None):
+        self.calls.append((dataset_type, dataId))
+        return {"data": dataId} if dataset_type == "raw" else FakeImageSilentClip()
+
+
 def test_factory_uses_provided_butler():
     butler = FakeButler()
     svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
@@ -74,6 +137,42 @@ def test_visit_detector_cutout_calls_butler_default_dataset_type():
     assert len(out) == 1
     assert out[0].token in {"root", "cutout"}
     assert butler.calls == [("visit_image", {"visit": 123, "detector": 9})]
+
+
+def test_edge_cutout_is_padded_by_default():
+    butler = FakeButler()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+
+    out = svc.cutout(visit=123, detector=9, x=0, y=0, h=5, w=5)
+    arr = out[0].getArray()
+
+    assert arr.shape == (5, 5)
+    assert arr[2, 2] == 0  # requested center pixel maps to image(0, 0)
+    assert arr[0, 0] == 0  # padded corner
+    assert arr[2, 3] == 1  # image(1, 0)
+    assert arr[3, 2] == 101  # image(0, 1)
+
+
+def test_edge_cutout_can_disable_padding():
+    butler = FakeButler()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+
+    out = svc.cutout(visit=123, detector=9, x=0, y=0, h=5, w=5, pad=False)
+    arr = out[0].getArray()
+
+    assert arr.shape == (3, 3)
+    assert arr[0, 0] == 0
+
+
+def test_edge_cutout_pads_when_factory_silently_clips():
+    butler = FakeButlerSilentClip()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+
+    out = svc.cutout(visit=123, detector=9, x=0, y=0, h=5, w=5)
+    arr = out[0].getArray()
+
+    assert arr.shape == (5, 5)
+    assert arr[2, 2] == 0
 
 
 def test_visit_detector_cutout_defaults_to_full_image_geometry():
