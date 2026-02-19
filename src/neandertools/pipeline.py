@@ -7,16 +7,16 @@ cutout extraction, and GIF assembly.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
-from astropy.time import Time
 
 from .trackbuilder import query_ephemeris, calculate_polygons
-from .imagefinder import find_overlapping_images, interpolate_position
-from .butler import ButlerCutoutService
-from .visualization import cutouts_gif
+from .imagefinder import find_overlapping_images, interpolate_position, create_cutout
+from .imagebuilder import get_exposure, cutout_to_png, create_gif
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +41,15 @@ class AsteroidCutoutPipeline:
     location : str
         Observer location code (default ``"X05"`` for Rubin).
     bands : list of str or None
-        Filter bands to search.  ``None`` defaults to ``["g", "r", "i"]``.
+        Filter bands to search.  ``None`` defaults to all ugrizy.
     step : str
-        Ephemeris time step (default ``"4h"``).
+        Ephemeris time step (default ``"12h"``).
     cutout_size : int
         Cutout side length in pixels (default ``100``).
     polygon_interval_days : float
         Max duration of each search polygon in days (default ``3.0``).
     polygon_widening_arcsec : float
-        Width of the search polygon on each side of the track (default ``120.0``).
+        Width of the search polygon on each side of the track (default ``2.0``).
     """
 
     def __init__(
@@ -89,10 +89,7 @@ class AsteroidCutoutPipeline:
     def run(
         self,
         output_path: Union[str, Path] = "asteroid.gif",
-        frame_duration_ms: int = 300,
-        warp_common_grid: bool = True,
-        show_ne_indicator: bool = False,
-        dpi: int = 100,
+        frame_duration_ms: int = 500,
     ) -> Path:
         """Execute the full pipeline and write an animated GIF.
 
@@ -102,13 +99,6 @@ class AsteroidCutoutPipeline:
             Output GIF file path.
         frame_duration_ms : int
             Duration of each GIF frame in milliseconds.
-        warp_common_grid : bool
-            If ``True``, warp all cutouts onto a common sky grid so the
-            asteroid appears to move across a stable background.
-        show_ne_indicator : bool
-            If ``True``, draw a North/East indicator arrow on each frame.
-        dpi : int
-            Resolution of the rendered frames.
 
         Returns
         -------
@@ -127,9 +117,6 @@ class AsteroidCutoutPipeline:
         gif_path = self._create_gif(
             output_path=output_path,
             frame_duration_ms=frame_duration_ms,
-            warp_common_grid=warp_common_grid,
-            show_ne_indicator=show_ne_indicator,
-            dpi=dpi,
         )
         return gif_path
 
@@ -188,16 +175,11 @@ class AsteroidCutoutPipeline:
             return
 
         butler = Butler(self.dr, collections=self.collection)
-        svc = ButlerCutoutService(butler=butler, repo=self.dr, collections=self.collection)
 
         eph = self.ephemeris
         mjd_grid = eph["times"].tai.mjd
 
-        visits = []
-        detectors = []
-        ra_values = []
-        dec_values = []
-        obs_times = []
+        paired = []
 
         for ref in self._dataset_refs:
             visit_id = ref.dataId["visit"]
@@ -210,7 +192,10 @@ class AsteroidCutoutPipeline:
                     "visit_image.visitInfo", visit=visit_id, detector=detector_id,
                 )
             except Exception as exc:
-                logger.warning("Cannot get visitInfo for visit=%s det=%s: %s", visit_id, detector_id, exc)
+                logger.warning(
+                    "Cannot get visitInfo for visit=%s det=%s: %s",
+                    visit_id, detector_id, exc,
+                )
                 continue
 
             t_mid = visit_info.date.toAstropy()
@@ -222,27 +207,24 @@ class AsteroidCutoutPipeline:
                 t_mid.mjd, mjd_grid, eph["ra_deg"], eph["dec_deg"],
             )
 
-            visits.append(visit_id)
-            detectors.append(detector_id)
-            ra_values.append(ra_interp)
-            dec_values.append(dec_interp)
-            obs_times.append({"time": t_mid, "band": band})
+            # Load full exposure
+            exposure = get_exposure(butler, visit_id, detector_id)
+            if exposure is None:
+                continue
 
-        if not visits:
-            return
+            # Extract cutout
+            cutout = create_cutout(
+                exposure, ra_interp, dec_interp, cutout_size_px=self.cutout_size,
+            )
+            if cutout is None:
+                logger.warning(
+                    "Target outside image for visit=%s det=%s", visit_id, detector_id,
+                )
+                continue
 
-        logger.info("Extracting %d cutouts (size=%dpx)...", len(visits), self.cutout_size)
-        raw_cutouts = svc.cutout(
-            ra=ra_values,
-            dec=dec_values,
-            visit=visits,
-            detector=detectors,
-            h=self.cutout_size,
-            w=self.cutout_size,
-        )
+            paired.append((cutout, {"time": t_mid, "band": band}))
 
-        # Pair cutouts with metadata and sort by observation time
-        paired = list(zip(raw_cutouts, obs_times))
+        # Sort by observation time
         paired.sort(key=lambda x: x[1]["time"].mjd)
 
         self.cutouts = [p[0] for p in paired]
@@ -253,25 +235,22 @@ class AsteroidCutoutPipeline:
         self,
         output_path: Union[str, Path],
         frame_duration_ms: int,
-        warp_common_grid: bool,
-        show_ne_indicator: bool,
-        dpi: int,
     ) -> Path:
-        """Step 5: Assemble cutouts into an animated GIF."""
-        titles = [
-            f"{meta['band']}-band  {meta['time'].utc.iso[:16]}"
-            for meta in self.frame_metadata
-        ]
+        """Step 5: Render cutouts to PNGs and assemble into a GIF."""
+        output_path = Path(output_path)
+
+        # Use a temp directory for intermediate PNGs
+        tmpdir = tempfile.mkdtemp(prefix="neandertools_")
+
+        for i, (cutout, meta) in enumerate(zip(self.cutouts, self.frame_metadata)):
+            title = f"{meta['band']}-band  {meta['time'].utc.iso[:16]}"
+            png_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
+            cutout_to_png(cutout, png_path, title=title)
 
         logger.info("Creating GIF with %d frames -> %s", len(self.cutouts), output_path)
-        gif_path = cutouts_gif(
-            images=self.cutouts,
+        gif_path = create_gif(
+            png_dir=tmpdir,
             output_path=output_path,
-            titles=titles,
-            warp_common_grid=warp_common_grid,
-            show_ne_indicator=show_ne_indicator,
-            frame_duration_ms=frame_duration_ms,
-            dpi=dpi,
+            duration=frame_duration_ms,
         )
-        logger.info("GIF saved: %s", gif_path)
         return gif_path
