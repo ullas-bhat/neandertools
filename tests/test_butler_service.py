@@ -97,6 +97,47 @@ def test_visit_detector_cutout_with_radec_center_uses_wcs():
     assert butler.calls == [("visit_image", {"visit": 123, "detector": 9})]
 
 
+def test_visit_detector_cutout_accepts_arrays():
+    butler = FakeButler()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+
+    out = svc.cutout(
+        visit=[123, 124],
+        detector=[9, 10],
+        ra=[12.3, 12.4],
+        dec=[-4.5, -4.6],
+        h=11,
+        w=11,
+    )
+
+    assert len(out) == 2
+    assert [call[1] for call in butler.calls] == [
+        {"visit": 123, "detector": 9},
+        {"visit": 124, "detector": 10},
+    ]
+
+
+def test_visit_detector_cutout_accepts_numpy_arrays():
+    np = pytest.importorskip("numpy")
+    butler = FakeButler()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+
+    out = svc.cutout(
+        visit=np.array([123, 124], dtype=int),
+        detector=np.array([9, 10], dtype=int),
+        ra=12.3,
+        dec=-4.5,
+        h=11,
+        w=11,
+    )
+
+    assert len(out) == 2
+    assert [call[1] for call in butler.calls] == [
+        {"visit": 123, "detector": 9},
+        {"visit": 124, "detector": 10},
+    ]
+
+
 def test_sky_cutout_requires_resolver():
     butler = FakeButler()
     svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
@@ -150,3 +191,6 @@ def test_invalid_args():
 
     with pytest.raises(ValueError):
         svc.cutout(visit=1, detector=2, ra=10, h=5, w=5)
+
+    with pytest.raises(ValueError):
+        svc.cutout(visit=[1, 2], detector=[3, 4, 5], ra=[10, 11], dec=[20, 21], h=5, w=5)

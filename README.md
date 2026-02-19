@@ -18,6 +18,16 @@ images = svc.cutout(visit=2024110800253, detector=5, x=2036, y=2000, h=201, w=20
 # center by sky coordinates (ra, dec), resolved via image WCS
 images = svc.cutout(visit=2024110800253, detector=5, ra=62.1, dec=-31.2, h=201, w=201)
 
+# vectorized input: one cutout per index
+images = svc.cutout(
+    visit=[2024110800253, 2024110800254],
+    detector=[5, 0],
+    ra=[62.1, 63.2],
+    dec=[-31.2, -30.9],
+    h=201,
+    w=201,
+)
+
 # optional override
 images = svc.cutout(
     visit=2024110800253,
@@ -36,5 +46,6 @@ images = svc.cutout(
 - `dataset_type` is selected per `cutout(...)` call and defaults to `"visit_image"`.
 - `cutout(...)` center must be specified as either (`x`, `y`) or (`ra`, `dec`).
 - If center is (`ra`, `dec`), WCS is used to convert to pixel coordinates.
+- `visit`, `detector`, `x`, `y`, `ra`, and `dec` can be scalars or arrays. Arrays are paired by index.
 - If `h`/`w` are omitted they default to full image size.
 - The sky-coordinate mode (`ra/dec/time`) is wired and needs a `sky_resolver` callback.
