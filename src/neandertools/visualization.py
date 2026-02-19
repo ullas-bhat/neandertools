@@ -21,6 +21,9 @@ def cutouts_grid(
     match_noise: bool = False,
     sigma_clip: float = 3.0,
     sigma_clip_iters: int = 5,
+    warp_common_grid: bool = False,
+    warp_shape: tuple[int, int] | None = None,
+    warp_pixel_scale_arcsec: float | None = None,
     add_colorbar: bool = False,
     cmap: str = "gray_r",
     show: bool = True,
@@ -53,6 +56,15 @@ def cutouts_grid(
         background/noise.
     sigma_clip_iters : int, optional
         Maximum number of sigma-clipping iterations.
+    warp_common_grid : bool, optional
+        If ``True``, warp all cutouts onto a common sky grid with +x in the
+        increasing Right Ascension direction.
+    warp_shape : tuple of int, optional
+        Output ``(height, width)`` for warped cutouts. Defaults to the first
+        image shape when ``warp_common_grid=True``.
+    warp_pixel_scale_arcsec : float, optional
+        Pixel scale of the common grid in arcsec/pixel. If omitted, a robust
+        scale is estimated from input WCS objects.
     add_colorbar : bool, optional
         If ``True``, draw one colorbar per subplot.
     cmap : str, optional
@@ -76,6 +88,10 @@ def cutouts_grid(
         raise ValueError("sigma_clip must be > 0")
     if sigma_clip_iters < 1:
         raise ValueError("sigma_clip_iters must be >= 1")
+    if warp_shape is not None and (warp_shape[0] <= 0 or warp_shape[1] <= 0):
+        raise ValueError("warp_shape dimensions must be > 0")
+    if warp_pixel_scale_arcsec is not None and warp_pixel_scale_arcsec <= 0:
+        raise ValueError("warp_pixel_scale_arcsec must be > 0")
 
     nrows = math.ceil(n / ncols)
     fig, axes = plt.subplots(
@@ -86,12 +102,32 @@ def cutouts_grid(
     )
 
     arrays = []
+    image_info = []
     for obj in images:
-        if hasattr(obj, "image"):
-            arr = np.asarray(obj.image.array)
-        else:
-            arr = np.asarray(obj.array)
+        arr = _extract_image_array(obj)
         arrays.append(arr)
+        wcs = obj.getWcs() if hasattr(obj, "getWcs") else None
+        x0 = 0.0
+        y0 = 0.0
+        if hasattr(obj, "getBBox"):
+            try:
+                bbox = obj.getBBox()
+                x0 = float(bbox.getMinX())
+                y0 = float(bbox.getMinY())
+            except Exception:
+                pass
+        image_info.append({"wcs": wcs, "x0": x0, "y0": y0})
+
+    extent = None
+    if warp_common_grid:
+        if any(info["wcs"] is None for info in image_info):
+            raise ValueError("warp_common_grid=True requires WCS for all input cutouts.")
+        arrays, extent = _warp_to_common_radec_grid(
+            arrays=arrays,
+            image_info=image_info,
+            warp_shape=warp_shape,
+            warp_pixel_scale_arcsec=warp_pixel_scale_arcsec,
+        )
 
     proc_arrays = []
     for arr in arrays:
@@ -139,6 +175,7 @@ def cutouts_grid(
             vmax=vmax,
             cmap=cmap,
             interpolation="nearest",
+            extent=extent,
         )
 
         ax.set_xticks([])
@@ -150,6 +187,10 @@ def cutouts_grid(
 
         if add_colorbar:
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if warp_common_grid:
+            ax.set_xlabel("Delta R.A. (arcsec)")
+            if c == 0:
+                ax.set_ylabel("Delta Dec. (arcsec)")
 
     for j in range(n, nrows * ncols):
         r, c = divmod(j, ncols)
@@ -188,3 +229,122 @@ def _sigma_clipped_bg_rms(arr: np.ndarray, sigma: float, maxiters: int) -> tuple
     if not np.isfinite(rms) or rms <= 0:
         rms = 1.0
     return bg, rms
+
+
+def _extract_image_array(obj: Any) -> np.ndarray:
+    if hasattr(obj, "image") and hasattr(obj.image, "array"):
+        return np.asarray(obj.image.array)
+    if hasattr(obj, "array"):
+        return np.asarray(obj.array)
+    if hasattr(obj, "getArray"):
+        return np.asarray(obj.getArray())
+    if hasattr(obj, "getImage"):
+        img = obj.getImage()
+        if hasattr(img, "getArray"):
+            return np.asarray(img.getArray())
+    raise ValueError("Unsupported image object: could not find array data.")
+
+
+def _warp_to_common_radec_grid(
+    *,
+    arrays: list[np.ndarray],
+    image_info: list[dict[str, Any]],
+    warp_shape: tuple[int, int] | None,
+    warp_pixel_scale_arcsec: float | None,
+) -> tuple[list[np.ndarray], tuple[float, float, float, float]]:
+    try:
+        import lsst.afw.geom as afwGeom
+        import lsst.afw.image as afwImage
+        import lsst.afw.math as afwMath
+        import lsst.geom as geom
+    except Exception as e:
+        raise ValueError("warp_common_grid=True requires LSST stack image/geom/math modules.") from e
+
+    if warp_shape is None:
+        out_h, out_w = arrays[0].shape
+    else:
+        out_h, out_w = warp_shape
+
+    ra_centers: list[float] = []
+    dec_centers: list[float] = []
+    scale_samples_deg: list[float] = []
+
+    for arr, info in zip(arrays, image_info):
+        wcs = info["wcs"]
+        x0 = info["x0"]
+        y0 = info["y0"]
+        h, w = arr.shape
+        xc = x0 + (w - 1) / 2.0
+        yc = y0 + (h - 1) / 2.0
+        ra_c, dec_c = wcs.pixelToSkyArray(np.array([xc]), np.array([yc]), degrees=True)
+        ra_centers.append(float(ra_c[0]))
+        dec_centers.append(float(dec_c[0]))
+
+        ra_x, dec_x = wcs.pixelToSkyArray(np.array([xc + 1.0]), np.array([yc]), degrees=True)
+        ra_y, dec_y = wcs.pixelToSkyArray(np.array([xc]), np.array([yc + 1.0]), degrees=True)
+        cos_dec = max(abs(np.cos(np.deg2rad(float(dec_c[0])))), 1e-6)
+        dra_x = _wrap_angle_diff_deg(float(ra_x[0]) - float(ra_c[0])) * cos_dec
+        ddec_x = float(dec_x[0]) - float(dec_c[0])
+        dra_y = _wrap_angle_diff_deg(float(ra_y[0]) - float(ra_c[0])) * cos_dec
+        ddec_y = float(dec_y[0]) - float(dec_c[0])
+        sx = float(np.hypot(dra_x, ddec_x))
+        sy = float(np.hypot(dra_y, ddec_y))
+        if np.isfinite(sx) and sx > 0:
+            scale_samples_deg.append(sx)
+        if np.isfinite(sy) and sy > 0:
+            scale_samples_deg.append(sy)
+
+    ra0 = _circular_mean_deg(ra_centers)
+    dec0 = float(np.mean(dec_centers))
+
+    if warp_pixel_scale_arcsec is None:
+        pixel_scale_deg = float(np.median(scale_samples_deg)) if scale_samples_deg else (1.0 / 3600.0)
+    else:
+        pixel_scale_deg = float(warp_pixel_scale_arcsec) / 3600.0
+
+    # Define common target TAN WCS with +x toward increasing RA and +y toward
+    # increasing Dec.
+    cd = np.array(
+        [
+            [pixel_scale_deg / max(abs(np.cos(np.deg2rad(dec0))), 1e-6), 0.0],
+            [0.0, pixel_scale_deg],
+        ],
+        dtype=np.float64,
+    )
+    cx = (out_w - 1) / 2.0
+    cy = (out_h - 1) / 2.0
+    dest_wcs = afwGeom.makeSkyWcs(
+        crpix=geom.Point2D(cx, cy),
+        crval=geom.SpherePoint(ra0 * geom.degrees, dec0 * geom.degrees),
+        cdMatrix=cd,
+    )
+
+    warp_ctrl = afwMath.WarpingControl("lanczos3")
+    warped_arrays = []
+    for arr, info in zip(arrays, image_info):
+        src_wcs = info["wcs"]
+        x0 = int(round(info["x0"]))
+        y0 = int(round(info["y0"]))
+
+        src_img = afwImage.ImageF(np.asarray(arr, dtype=np.float32))
+        src_img.setXY0(geom.Point2I(x0, y0))
+
+        dest_img = afwImage.ImageF(out_w, out_h)
+        afwMath.warpImage(dest_img, dest_wcs, src_img, src_wcs, warp_ctrl, np.nan)
+        warped_arrays.append(np.asarray(dest_img.array, dtype=np.float32))
+
+    x_arcsec = (np.arange(out_w, dtype=np.float64) - cx) * (pixel_scale_deg * 3600.0)
+    y_arcsec = (np.arange(out_h, dtype=np.float64) - cy) * (pixel_scale_deg * 3600.0)
+    extent = (float(x_arcsec[0]), float(x_arcsec[-1]), float(y_arcsec[0]), float(y_arcsec[-1]))
+    return warped_arrays, extent
+
+
+def _circular_mean_deg(values_deg: Sequence[float]) -> float:
+    values_rad = np.deg2rad(np.asarray(values_deg, dtype=np.float64))
+    s = np.mean(np.sin(values_rad))
+    c = np.mean(np.cos(values_rad))
+    return float(np.rad2deg(np.arctan2(s, c)) % 360.0)
+
+
+def _wrap_angle_diff_deg(delta_deg: float) -> float:
+    return (delta_deg + 180.0) % 360.0 - 180.0
