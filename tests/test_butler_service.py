@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from astropy.time import Time
 
 import neandertools as nt
 
@@ -194,3 +195,38 @@ def test_invalid_args():
 
     with pytest.raises(ValueError):
         svc.cutout(visit=[1, 2], detector=[3, 4, 5], ra=[10, 11], dec=[20, 21], h=5, w=5)
+
+
+def test_find_visit_detector_scalar_and_vector():
+    class AlwaysContainsRegion:
+        def contains(self, _point):
+            return True
+
+    butler = FakeButler()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+    svc._get_visit_detector_index = lambda _dataset_type: [
+        {
+            "visit": 101,
+            "detector": 5,
+            "region": AlwaysContainsRegion(),
+            "begin": Time("2024-01-01T00:00:00", scale="tai"),
+            "end": Time("2024-01-01T00:01:00", scale="tai"),
+        }
+    ]
+
+    one = svc.find_visit_detector(ra=53.0, dec=-27.9, t="2024-01-01T00:00:30")
+    many = svc.find_visit_detector(
+        ra=[53.0, 53.0],
+        dec=[-27.9, -27.9],
+        t=["2024-01-01T00:00:30", "2024-01-01T00:02:00"],
+    )
+
+    assert one == [(101, 5)]
+    assert many == [[(101, 5)], []]
+
+
+def test_find_visit_detector_length_mismatch_raises():
+    butler = FakeButler()
+    svc = nt.cutouts_from_butler("dp1", collections="test", butler=butler)
+    with pytest.raises(ValueError):
+        svc.find_visit_detector(ra=[53.0, 53.1], dec=[-27.9], t=["2024-01-01T00:00:30", "2024-01-01T00:00:40", "2024-01-01T00:00:50"])

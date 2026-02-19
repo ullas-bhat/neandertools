@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional, Union
 
+from astropy.time import Time
 from lsst.daf.butler import Butler
 from lsst.geom import Box2I, Point2I, SpherePoint, degrees
+from lsst.sphgeom import LonLat, UnitVector3d
 
 DataId = dict[str, Any]
 SkyResolver = Callable[[float, float, Optional[Union[datetime, str]]], Iterable[DataId]]
@@ -19,6 +21,7 @@ class ButlerCutoutService:
     def __init__(self, butler: Any, sky_resolver: Optional[SkyResolver] = None) -> None:
         self._butler = butler
         self._sky_resolver = sky_resolver
+        self._visit_detector_index_cache: dict[str, list[dict[str, Any]]] = {}
 
     def cutout(
         self,
@@ -92,6 +95,57 @@ class ButlerCutoutService:
                     return out
         return out
 
+    def find_visit_detector(
+        self,
+        ra: Union[float, Sequence[float]],
+        dec: Union[float, Sequence[float]],
+        t: Union[datetime, str, Time, Sequence[datetime], Sequence[str], Sequence[Time]],
+        *,
+        dataset_type: str = "visit_image",
+    ) -> Union[list[tuple[int, int]], list[list[tuple[int, int]]]]:
+        """Find (visit, detector) entries containing sky position at exposure time.
+
+        Parameters
+        ----------
+        ra, dec : float or 1D sequence of float
+            Sky coordinates in degrees.
+        t : datetime | str | astropy.time.Time | 1D sequence
+            Query times. A match requires ``begin <= t < end``.
+        dataset_type : str
+            Dataset type used to build the visit/detector index.
+        """
+        ra_values = _as_list(ra, "ra")
+        dec_values = _as_list(dec, "dec")
+        t_values = _as_list(t, "t")
+        assert ra_values is not None and dec_values is not None and t_values is not None
+
+        n = max(len(ra_values), len(dec_values), len(t_values))
+        ra_values = _broadcast_to(ra_values, n, "ra")
+        dec_values = _broadcast_to(dec_values, n, "dec")
+        t_values = _broadcast_to(t_values, n, "t")
+        t_values = [_to_astropy_time(v) for v in t_values]
+
+        index = self._get_visit_detector_index(dataset_type)
+        all_matches: list[list[tuple[int, int]]] = []
+
+        for ra_i, dec_i, t_i in zip(ra_values, dec_values, t_values):
+            point = UnitVector3d(LonLat.fromDegrees(float(ra_i), float(dec_i)))
+            matches: list[tuple[int, int]] = []
+            for row in index:
+                if "timespan" in row:
+                    if not row["timespan"].contains(t_i):
+                        continue
+                else:
+                    if not (row["begin"] <= t_i < row["end"]):
+                        continue
+                if row["region"].contains(point):
+                    matches.append((row["visit"], row["detector"]))
+            all_matches.append(matches)
+
+        if n == 1:
+            return all_matches[0]
+        return all_matches
+
     def _extract_cutout(
         self,
         image: Any,
@@ -133,6 +187,31 @@ class ButlerCutoutService:
             pass
 
         return image.Factory(image, cutout_box)
+
+    def _get_visit_detector_index(self, dataset_type: str) -> list[dict[str, Any]]:
+        cached = self._visit_detector_index_cache.get(dataset_type)
+        if cached is not None:
+            return cached
+
+        out: list[dict[str, Any]] = []
+        query = self._butler.registry.queryDataIds(["visit", "detector"], datasets=dataset_type).expanded()
+        for coord in query:
+            if not coord.hasRecords() or coord.region is None:
+                continue
+            timespan = coord.records["visit"].timespan
+            if timespan is None or timespan.begin is None or timespan.end is None:
+                continue
+            out.append(
+                {
+                    "visit": int(coord["visit"]),
+                    "detector": int(coord["detector"]),
+                    "region": coord.region,
+                    "timespan": timespan,
+                }
+            )
+
+        self._visit_detector_index_cache[dataset_type] = out
+        return out
 
 
 def cutouts_from_butler(
@@ -221,3 +300,13 @@ def _broadcast_to(values: list[Any], n: int, name: str) -> list[Any]:
     if len(values) == 1:
         return values * n
     raise ValueError(f"{name} must have length 1 or {n}")
+
+
+def _to_astropy_time(value: Union[datetime, str, Time]) -> Time:
+    if isinstance(value, Time):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return Time(value, scale="tai")
+        return Time(value)
+    return Time(value, scale="tai")
