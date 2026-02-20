@@ -7,16 +7,15 @@ cutout extraction, and GIF assembly.
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
 
 from .trackbuilder import query_ephemeris, calculate_polygons
-from .imagefinder import find_overlapping_images, interpolate_position, create_cutout
-from .imagebuilder import get_exposure, cutout_to_png, create_gif, normalize_cutouts
+from .imagefinder import find_overlapping_images, interpolate_position
+from .butler import ButlerCutoutService
+from .visualization import cutouts_grid as viz_cutouts_grid, cutouts_gif as viz_cutouts_gif
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +92,7 @@ class AsteroidCutoutPipeline:
         match_background: bool = True,
         match_noise: bool = False,
         show_ne: bool = False,
+        warp_common_grid: bool = False,
     ) -> Path:
         """Execute the full pipeline and write an animated GIF.
 
@@ -110,6 +110,9 @@ class AsteroidCutoutPipeline:
             share the same noise scale (SNR-like display).
         show_ne : bool
             If ``True``, draw a North/East compass indicator on each frame.
+        warp_common_grid : bool
+            If ``True``, warp all cutouts onto a common sky grid with +x
+            toward increasing RA. Requires LSST stack warp modules.
 
         Returns
         -------
@@ -131,8 +134,67 @@ class AsteroidCutoutPipeline:
             match_background=match_background,
             match_noise=match_noise,
             show_ne=show_ne,
+            warp_common_grid=warp_common_grid,
         )
         return gif_path
+
+    def grid(
+        self,
+        ncols: int = 5,
+        match_background: bool = True,
+        match_noise: bool = False,
+        show_ne: bool = False,
+        warp_common_grid: bool = False,
+        cmap: str = "gray",
+        show: bool = True,
+    ):
+        """Display extracted cutouts in a grid.
+
+        Must be called after ``run()`` or after manually running the pipeline
+        steps so that ``self.cutouts`` is populated.
+
+        Parameters
+        ----------
+        ncols : int
+            Number of columns in the grid.
+        match_background : bool
+            Subtract per-cutout background for uniform zero level.
+        match_noise : bool
+            Divide by per-cutout RMS for uniform noise scale.
+        show_ne : bool
+            Draw a North/East compass indicator on each panel.
+        warp_common_grid : bool
+            Warp all cutouts onto a common sky grid.
+        cmap : str
+            Matplotlib colormap name.
+        show : bool
+            If ``True``, call ``plt.show()``.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axes)`` from matplotlib.
+        """
+        if not self.cutouts:
+            logger.warning("No cutouts to display. Run the pipeline first.")
+            return None, None
+
+        titles = [
+            f"{meta['band']}-band\n{meta['time'].utc.iso[:16]}"
+            for meta in self.frame_metadata
+        ]
+
+        return viz_cutouts_grid(
+            images=self.cutouts,
+            ncols=ncols,
+            titles=titles,
+            match_background=match_background,
+            match_noise=match_noise,
+            show_ne_indicator=show_ne,
+            warp_common_grid=warp_common_grid,
+            cmap=cmap,
+            show=show,
+        )
 
     # ------------------------------------------------------------------
     # Pipeline steps
@@ -189,6 +251,7 @@ class AsteroidCutoutPipeline:
             return
 
         butler = Butler(self.dr, collections=self.collection)
+        cutout_svc = ButlerCutoutService(butler, repo=self.dr, collections=self.collection)
 
         eph = self.ephemeris
         mjd_grid = eph["times"].tai.mjd
@@ -221,28 +284,22 @@ class AsteroidCutoutPipeline:
                 t_mid.mjd, mjd_grid, eph["ra_deg"], eph["dec_deg"],
             )
 
-            # Load full exposure
-            exposure = get_exposure(butler, visit_id, detector_id)
-            if exposure is None:
-                continue
-
-            # Extract cutout
-            cutout = create_cutout(
-                exposure, ra_interp, dec_interp, cutout_size_px=self.cutout_size,
-            )
-            if cutout is None:
-                logger.warning(
-                    "Target outside image for visit=%s det=%s", visit_id, detector_id,
+            # Extract cutout via ButlerCutoutService (handles loading + cutting + padding)
+            try:
+                results = cutout_svc.cutout(
+                    ra=ra_interp,
+                    dec=dec_interp,
+                    h=self.cutout_size,
+                    w=self.cutout_size,
+                    visit=visit_id,
+                    detector=detector_id,
+                    pad=True,
                 )
-                continue
-
-            # Skip cutouts clipped by the image edge
-            bbox = cutout.getBBox()
-            if bbox.getWidth() < self.cutout_size or bbox.getHeight() < self.cutout_size:
+                cutout = results[0]
+            except Exception as exc:
                 logger.warning(
-                    "Skipping edge cutout for visit=%s det=%s (%dx%d < %d)",
-                    visit_id, detector_id,
-                    bbox.getWidth(), bbox.getHeight(), self.cutout_size,
+                    "Cutout failed for visit=%s det=%s: %s",
+                    visit_id, detector_id, exc,
                 )
                 continue
 
@@ -262,39 +319,23 @@ class AsteroidCutoutPipeline:
         match_background: bool = True,
         match_noise: bool = False,
         show_ne: bool = False,
+        warp_common_grid: bool = False,
     ) -> Path:
-        """Step 5: Render cutouts to PNGs and assemble into a GIF."""
-        output_path = Path(output_path)
-
-        # Normalize all cutouts to a shared background/noise scale
-        raw_arrays = [c.image.array for c in self.cutouts]
-        if match_background or match_noise:
-            norm_arrays, vmin, vmax = normalize_cutouts(
-                raw_arrays,
-                match_background=match_background,
-                match_noise=match_noise,
-            )
-        else:
-            norm_arrays = [None] * len(self.cutouts)
-            vmin, vmax = None, None
-
-        # Use a temp directory for intermediate PNGs
-        tmpdir = tempfile.mkdtemp(prefix="neandertools_")
-
-        for i, (cutout, meta) in enumerate(zip(self.cutouts, self.frame_metadata)):
-            title = f"{meta['band']}-band  {meta['time'].utc.iso[:16]}"
-            png_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
-            cutout_to_png(
-                cutout, png_path, title=title,
-                vmin=vmin, vmax=vmax,
-                array_override=norm_arrays[i] if norm_arrays[i] is not None else None,
-                show_ne=show_ne,
-            )
+        """Step 5: Render cutouts to an animated GIF."""
+        titles = [
+            f"{meta['band']}-band  {meta['time'].utc.iso[:16]}"
+            for meta in self.frame_metadata
+        ]
 
         logger.info("Creating GIF with %d frames -> %s", len(self.cutouts), output_path)
-        gif_path = create_gif(
-            png_dir=tmpdir,
+        gif_path = viz_cutouts_gif(
+            images=self.cutouts,
             output_path=output_path,
-            duration=frame_duration_ms,
+            titles=titles,
+            match_background=match_background,
+            match_noise=match_noise,
+            show_ne_indicator=show_ne,
+            warp_common_grid=warp_common_grid,
+            frame_duration_ms=frame_duration_ms,
         )
         return gif_path

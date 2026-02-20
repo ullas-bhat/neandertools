@@ -151,6 +151,9 @@ def _wrap_angle_diff_deg(delta_deg):
 def _get_ne_vectors(cutout_exposure):
     """Compute North and East unit vectors in pixel coordinates.
 
+    Uses the inverse WCS (skyToPixel) directly to find where North and East
+    are in pixel space, avoiding Jacobian matrix algebra.
+
     Parameters
     ----------
     cutout_exposure : lsst.afw.image.ExposureF
@@ -174,47 +177,42 @@ def _get_ne_vectors(cutout_exposure):
     xc = xy0.getX() + w / 2.0
     yc = xy0.getY() + h / 2.0
 
-    # Sky coords at center and at +x, +y offsets (1-pixel step)
+    # Get sky position of center
     sky_c = wcs.pixelToSkyArray(np.array([xc]), np.array([yc]), degrees=True)
-    sky_x = wcs.pixelToSkyArray(np.array([xc + 1.0]), np.array([yc]), degrees=True)
-    sky_y = wcs.pixelToSkyArray(np.array([xc]), np.array([yc + 1.0]), degrees=True)
-
-    ra_c, dec_c = float(sky_c[0][0]), float(sky_c[1][0])
+    ra_c = float(sky_c[0][0])
+    dec_c = float(sky_c[1][0])
     cos_dec = max(abs(np.cos(np.radians(dec_c))), 1e-6)
 
-    # Jacobian: pixel offset -> (RA*cos_dec, Dec) in arcsec
-    # Use _wrap_angle_diff_deg to handle RA wrapping at 0/360 degrees
-    dra_dx = _wrap_angle_diff_deg(float(sky_x[0][0]) - ra_c) * cos_dec
-    ddec_dx = float(sky_x[1][0]) - dec_c
-    dra_dy = _wrap_angle_diff_deg(float(sky_y[0][0]) - ra_c) * cos_dec
-    ddec_dy = float(sky_y[1][0]) - dec_c
+    # Small sky offset (5 arcsec) to probe directions
+    offset_deg = 5.0 / 3600.0
 
-    # Jacobian maps pixel (dx, dy) -> (East, North)
-    # East = +dRA * cos(dec),  North = +dDec
-    jac = np.array([[dra_dx, dra_dy],
-                     [ddec_dx, ddec_dy]])
-    try:
-        inv_jac = np.linalg.inv(jac)
-    except np.linalg.LinAlgError:
-        return None
+    # Find pixel position of a point slightly NORTH of center (+Dec)
+    pix_n = wcs.skyToPixelArray(
+        np.array([ra_c]), np.array([dec_c + offset_deg]), degrees=True
+    )
+    north_dx = float(pix_n[0][0]) - xc
+    north_dy = float(pix_n[1][0]) - yc
 
-    # East in pixel coords (east_sky=1, north_sky=0)
-    east_px = inv_jac @ np.array([1.0, 0.0])
-    # North in pixel coords (east_sky=0, north_sky=1)
-    north_px = inv_jac @ np.array([0.0, 1.0])
+    # Find pixel position of a point slightly EAST of center (+RA)
+    pix_e = wcs.skyToPixelArray(
+        np.array([ra_c + offset_deg / cos_dec]), np.array([dec_c]), degrees=True
+    )
+    east_dx = float(pix_e[0][0]) - xc
+    east_dy = float(pix_e[1][0]) - yc
 
     # Normalize to unit vectors
-    e_norm = np.hypot(east_px[0], east_px[1])
-    n_norm = np.hypot(north_px[0], north_px[1])
-    if e_norm > 0:
-        east_px = east_px / e_norm
-    if n_norm > 0:
-        north_px = north_px / n_norm
+    n_norm = np.hypot(north_dx, north_dy)
+    e_norm = np.hypot(east_dx, east_dy)
+    if n_norm <= 0 or e_norm <= 0:
+        return None
+
+    north_px = np.array([north_dx / n_norm, north_dy / n_norm])
+    east_px = np.array([east_dx / e_norm, east_dy / e_norm])
 
     return north_px, east_px
 
 
-def _draw_ne_indicator(ax, cutout_exposure, arrow_frac=0.15):
+def _draw_ne_indicator(ax, cutout_exposure, arrow_frac=0.12):
     """Draw a North/East compass indicator on a plot axes.
 
     Parameters
@@ -231,39 +229,44 @@ def _draw_ne_indicator(ax, cutout_exposure, arrow_frac=0.15):
         return
 
     north_px, east_px = vectors
-    h, w = cutout_exposure.image.array.shape
 
-    # Arrow origin: top-right corner area
-    ox = w * 0.85
-    oy = h * 0.85
-    length = min(h, w) * arrow_frac
+    # Use axis limits (works with any coordinate system / extent)
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    length = min(dx, dy) * arrow_frac
+
+    # Place arrow base in upper-left area (away from edges in all directions)
+    ox = min(x0, x1) + 0.18 * dx
+    oy = max(y0, y1) - 0.18 * dy
 
     # North arrow
+    n_tip = (ox + length * north_px[0], oy + length * north_px[1])
     ax.annotate(
-        "", xy=(ox + length * north_px[0], oy + length * north_px[1]),
-        xytext=(ox, oy),
+        "", xy=n_tip, xytext=(ox, oy),
         arrowprops=dict(arrowstyle="-|>", color="red", lw=1.5),
-        zorder=10,
+        clip_on=False, zorder=10,
     )
     ax.text(
-        ox + length * 1.25 * north_px[0],
-        oy + length * 1.25 * north_px[1],
+        ox + length * 1.3 * north_px[0],
+        oy + length * 1.3 * north_px[1],
         "N", color="red", fontsize=7, fontweight="bold",
-        ha="center", va="center", zorder=10,
+        ha="center", va="center", clip_on=False, zorder=10,
     )
 
     # East arrow
+    e_tip = (ox + length * east_px[0], oy + length * east_px[1])
     ax.annotate(
-        "", xy=(ox + length * east_px[0], oy + length * east_px[1]),
-        xytext=(ox, oy),
+        "", xy=e_tip, xytext=(ox, oy),
         arrowprops=dict(arrowstyle="-|>", color="cyan", lw=1.5),
-        zorder=10,
+        clip_on=False, zorder=10,
     )
     ax.text(
-        ox + length * 1.25 * east_px[0],
-        oy + length * 1.25 * east_px[1],
+        ox + length * 1.3 * east_px[0],
+        oy + length * 1.3 * east_px[1],
         "E", color="cyan", fontsize=7, fontweight="bold",
-        ha="center", va="center", zorder=10,
+        ha="center", va="center", clip_on=False, zorder=10,
     )
 
 
