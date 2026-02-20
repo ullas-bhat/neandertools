@@ -302,7 +302,13 @@ class AsteroidCutoutPipeline:
                     visit_id, detector_id, exc,
                 )
                 continue
-
+                
+            if cutout is None:
+                logger.warning(
+                    "Target outside image for visit=%s det=%s", visit_id, detector_id,
+                )
+                continue
+            
             paired.append((cutout, {"time": t_mid, "band": band}))
 
         # Sort by observation time

@@ -405,6 +405,8 @@ def _sigma_clipped_bg_rms(arr: np.ndarray, sigma: float, maxiters: int) -> tuple
 
 
 def _extract_image_array(obj: Any) -> np.ndarray:
+    if isinstance(obj, np.ndarray):
+        return obj
     if hasattr(obj, "image") and hasattr(obj.image, "array"):
         return np.asarray(obj.image.array)
     if hasattr(obj, "array"):

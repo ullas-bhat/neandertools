@@ -301,6 +301,9 @@ class ButlerCutoutService:
         cutout_box = Box2I(Point2I(x0, y0), Point2I(x1, y1))
         try:
             cutout_box.clip(bbox)
+            if cutout_box.isEmpty():
+                return None
+            
         except Exception:
             pass
 
@@ -315,6 +318,9 @@ class ButlerCutoutService:
             Point2I(requested_box.getMaxX(), requested_box.getMaxY()),
         )
         clipped_box.clip(bbox)
+        if clipped_box.isEmpty():
+            return None
+        
         source_cutout = image.Factory(image, clipped_box)
 
         source_array = self._get_primary_array(source_cutout)
