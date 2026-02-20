@@ -232,6 +232,16 @@ class AsteroidCutoutPipeline:
                 )
                 continue
 
+            # Skip cutouts clipped by the image edge
+            bbox = cutout.getBBox()
+            if bbox.getWidth() < self.cutout_size or bbox.getHeight() < self.cutout_size:
+                logger.warning(
+                    "Skipping edge cutout for visit=%s det=%s (%dx%d < %d)",
+                    visit_id, detector_id,
+                    bbox.getWidth(), bbox.getHeight(), self.cutout_size,
+                )
+                continue
+
             paired.append((cutout, {"time": t_mid, "band": band}))
 
         # Sort by observation time

@@ -171,6 +171,102 @@ def cutout_to_png(cutout_exposure, output_path, title="", vmin=None, vmax=None, 
     plt.close(fig)
 
 
+def cutouts_grid(
+    cutouts,
+    metadata=None,
+    ncols=5,
+    figsize_per_cell=(3.0, 3.0),
+    match_background=True,
+    match_noise=True,
+    cmap="gray",
+    output_path=None,
+    dpi=100,
+    show=True,
+):
+    """Display cutouts in a grid with matched background/noise.
+
+    Parameters
+    ----------
+    cutouts : list
+        List of LSST ExposureF cutout objects (with ``.image.array``).
+    metadata : list of dict or None
+        Per-cutout metadata dicts with ``"band"`` and ``"time"`` keys
+        (as produced by ``AsteroidCutoutPipeline``). Used for titles.
+        If ``None``, frames are numbered.
+    ncols : int
+        Number of columns in the grid.
+    figsize_per_cell : tuple of float
+        ``(width, height)`` per subplot cell in inches.
+    match_background : bool
+        If ``True``, subtract per-cutout background for a uniform zero level.
+    match_noise : bool
+        If ``True``, also divide by per-cutout RMS for uniform noise scale.
+    cmap : str
+        Matplotlib colormap name.
+    output_path : str, Path, or None
+        If provided, save the figure to this path.
+    dpi : int
+        Resolution for the saved figure.
+    show : bool
+        If ``True``, call ``plt.show()``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : np.ndarray of matplotlib.axes.Axes
+    """
+    import math
+
+    n = len(cutouts)
+    if n == 0:
+        raise ValueError("No cutouts to display.")
+
+    raw_arrays = [c.image.array for c in cutouts]
+    norm_arrays, vmin, vmax = normalize_cutouts(
+        raw_arrays,
+        match_background=match_background,
+        match_noise=match_noise,
+    )
+
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(figsize_per_cell[0] * ncols, figsize_per_cell[1] * nrows),
+        squeeze=False,
+    )
+
+    for i in range(n):
+        r, c = divmod(i, ncols)
+        ax = axes[r][c]
+        ax.imshow(
+            norm_arrays[i], origin="lower", cmap=cmap,
+            vmin=vmin, vmax=vmax, interpolation="nearest",
+        )
+        if metadata is not None and i < len(metadata):
+            meta = metadata[i]
+            title = f"{meta['band']}-band\n{meta['time'].utc.iso[:16]}"
+        else:
+            title = f"Frame {i + 1}"
+        ax.set_title(title, fontsize=8)
+        ax.axis("off")
+
+    # Turn off unused cells
+    for j in range(n, nrows * ncols):
+        r, c = divmod(j, ncols)
+        axes[r][c].axis("off")
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        fig.savefig(str(output_path), dpi=dpi, bbox_inches="tight")
+        print(f"Grid saved to {output_path}")
+
+    if show:
+        plt.show()
+
+    return fig, axes
+
+
 def create_gif(png_dir, output_path, duration=500):
     """Create an animated GIF from a directory of PNG frames.
 
