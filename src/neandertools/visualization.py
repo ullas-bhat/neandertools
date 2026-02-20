@@ -371,13 +371,7 @@ def _prepare_cutouts_for_display(
         if not finite_parts:
             raise ValueError("No finite pixels available to determine display scale.")
         all_values = np.concatenate(finite_parts)
-
-        # shared_vmin = float(np.quantile(all_values, qmin))
-        # shared_vmax = float(np.quantile(all_values, qmax))
-        # if shared_vmax <= shared_vmin:
-        #     shared_vmax = shared_vmin + 1e-12
-        # vmins = [shared_vmin] * n
-        # vmaxs = [shared_vmax] * n
+        
         if auto_vlims:
             norm = ZScaleInterval(contrast=contrast, krej=3).get_limits(all_values)
             vmins = [norm[0]] * n
@@ -398,6 +392,8 @@ def _prepare_cutouts_for_display(
                 vmax = vmin + 1e-12
             vmins.append(vmin)
             vmaxs.append(vmax)
+
+    print(vmins, vmaxs)
 
     return proc_arrays, vmins, vmaxs, extents, ne_vectors
 
