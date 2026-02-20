@@ -149,7 +149,7 @@ def cutouts_grid(
             # _warp_to_common_radec_grid edited to have RA increase to the left
             # N/E vectors calculated from the actual WCS
             ax.set_xlabel("Delta R.A. (arcsec)")
-            ax.invert_xaxis() # East to the left. 
+            ax.invert_xaxis()  # East to the left.
             if c == 0:
                 ax.set_ylabel("Delta Dec. (arcsec)")
 
@@ -247,6 +247,7 @@ def cutouts_gif(
     if warp_common_grid:
         ax.set_xlabel("Delta R.A. (arcsec)")
         ax.set_ylabel("Delta Dec. (arcsec)")
+        ax.invert_xaxis()  # East to the left.
     ne_artists: list[Any] = []
     if show_ne_indicator:
         ne_artists = _draw_ne_indicator(ax, ne_vectors[0], scale_frac=ne_indicator_scale)
@@ -437,6 +438,8 @@ def _sigma_clipped_bg_rms(arr: np.ndarray, sigma: float, maxiters: int) -> tuple
 
 
 def _extract_image_array(obj: Any) -> np.ndarray:
+    if isinstance(obj, np.ndarray):
+        return obj
     if hasattr(obj, "image") and hasattr(obj.image, "array"):
         return np.asarray(obj.image.array)
     if hasattr(obj, "array"):
